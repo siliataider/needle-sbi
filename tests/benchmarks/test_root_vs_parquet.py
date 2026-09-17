@@ -31,8 +31,9 @@ the paths to the datasets because they are overwritten by the two environment va
 above.
 """
 
+import os
 from pathlib import Path
-from typing import Annotated, Callable, Dict, List, Literal, cast
+from typing import Annotated, Any, Callable, Dict, List, Literal, cast
 
 import pydantic
 import pytest
@@ -50,6 +51,30 @@ Percentage = Annotated[float, pydantic.Field(ge=0.0, le=100.0)]
 
 
 DELPHES_DATASET_CONFIG = Path(__file__).parents[1] / "conf_tests" / "datasets" / "delphes.yaml"
+
+FileType = Literal["parquet", "root", "rdataloader"]
+
+# --- RDataLoader arm --------------------------------------------------------------------------
+# "rdataloader" reads the *same .root files* as the "root" arm, but through ROOT's native
+# RDataLoader (via ROOTPaddedDataModule) instead of uproot -> dask_awkward -> PaddedDaskDataset.
+#
+# Batch size for EVERY backend -- the dask arms' torch DataLoader and RDataLoader alike -- so the
+# comparison always happens at one operating point. Default 1 reproduces upstream (a bare
+# `DataLoader(dataset)` uses torch's default batch_size=1), but 1 is a degenerate point for
+# RDataLoader: its in-memory window is batch_size * batches_in_memory, so batch_size=1 leaves it
+# doing a C++ round trip per single event. Set BENCH_BATCH_SIZE=512 for a realistic comparison.
+BENCH_BATCH_SIZE = int(os.getenv("BENCH_BATCH_SIZE", "1"))
+# RDataLoader's resident window is batch_size * batches_in_memory events. 200000 makes that window
+# cover the whole dataset at every BENCH_BATCH_SIZE (>= 200k events even at batch_size=1), so the
+# batch size never shrinks it. For reference, `PaddedDaskDataset` holds one partition (one file,
+# 10k events here) at a time; matching that instead (e.g. 20 at batch 512) measured ~2% slower for
+# 0.6 GB less RSS.
+RDATALOADER_BATCHES_IN_MEMORY = int(os.getenv("RDATALOADER_BATCHES_IN_MEMORY", "200000"))
+# Delphes collections are jagged, and RDataLoader materialises them at a fixed width. These are the
+# global maxima of the `<Collection>_size` counter branches over the dataset; anything smaller
+# silently truncates events.
+MAX_VEC_SIZES: Dict[str, int] = {"Track": 253, "Photon": 3}
+DELPHES_TREE_NAME = os.getenv("DELPHES_TREE_NAME", "Delphes")
 
 
 @pytest.fixture()
@@ -139,7 +164,7 @@ def run_test(
     config: EstimatorConfig,
     paths: List[str],
     drop_branches: List[str],
-    file_type: Literal["parquet", "root"],
+    file_type: FileType,
 ) -> Callable:
     """Benchmark between root and parquet file ingestion with dask_awkward
 
@@ -166,14 +191,36 @@ def run_test(
 
         return _filter
 
+    def split_columns() -> tuple:
+        """Split the configured feature columns into (features, labels).
+
+        The config's own `labels_columns` (Photon.*) cannot be used as the label side here:
+        `PaddedDatasetBase` caches a single `_feature_padding_length` and applies it to features
+        and labels alike, and `add_innermost_dimension` takes a different branch for collections
+        with empty events (Photon is empty in most events, Track never is). Mixing the two
+        collections therefore dies in `ak.to_numpy` with "subarray lengths are not regular".
+        That is very likely why upstream passes the *same* ingestor as both features and labels.
+
+        Holding the last configured column out as the target keeps both sides within one
+        collection, so every backend reads exactly `len(columns)` distinct columns once, and both
+        emit the same (x, y) split. With a single configured column there is nothing to hold out,
+        so upstream's duplicate-ingestor behaviour is kept for that parametrization.
+        """
+        assert config.dataset_override is not None
+        columns = list(config.dataset_override.features_columns or [])
+        if len(columns) < 2:
+            return columns, columns
+        return columns[:-1], columns[-1:]
+
     def reader_kwargs() -> Dict[str, Callable]:
         assert config.dataset_override is not None
         assert config.dataset_override.features_columns is not None
         match file_type:
-            case "parquet":
-                return {}
             case "root":
                 return {"filter_name": filter_name_func(config.dataset_override.features_columns)}
+            case _:
+                # parquet needs none; the rdataloader arm bypasses the Ingestor entirely
+                return {}
 
     def _test_only_metadata():
         """Test function to read the metadata from the files
@@ -219,17 +266,98 @@ def run_test(
         - The DataLoader can iterate through the dataset without exceptions
         """
         assert config.dataset_override is not None
-        ingestor = Ingestor(
+        features, labels = split_columns()
+        features_ingestor = Ingestor(
             paths=paths,
             format="automatic",
-            columns=config.dataset_override.features_columns,
+            columns=features,
             max_number_events=config.dataset_override.max_number_events,
-            reader_kwargs=reader_kwargs(),
+            reader_kwargs=({"filter_name": filter_name_func(features)} if file_type == "root" else {}),
         )
-        datamodule = PaddedDaskDataset(ingestor, ingestor)
-        dataloader = DataLoader(datamodule)
+        # Upstream passed the *same* ingestor as both features and labels, which makes the dask
+        # arms compute and tensor-convert the identical columns twice per partition while the
+        # rdataloader arm reads features + targets once each. Using the config's real
+        # `labels_columns` keeps every backend reading the same column set exactly once.
+        labels_ingestor = Ingestor(
+            paths=paths,
+            format="automatic",
+            columns=labels,
+            max_number_events=config.dataset_override.max_number_events,
+            reader_kwargs=({"filter_name": filter_name_func(labels)} if file_type == "root" else {}),
+        )
+        datamodule = PaddedDaskDataset(features_ingestor, labels_ingestor)
+        dataloader = DataLoader(datamodule, batch_size=BENCH_BATCH_SIZE)
 
         for _ in dataloader:
+            pass
+
+    # --- RDataLoader equivalents of the three stages above ------------------
+    # Same three depths, same .root files, but read through ROOT's native RDataLoader
+    # (wrapped in ROOTPaddedDataModule) instead of uproot -> dask_awkward -> PaddedDaskDataset.
+
+    def _make_root_datamodule() -> Any:
+        """Build a ROOTPaddedDataModule over the same paths/columns as the dask arms."""
+        from needle.ml.lightning.datamodules.root_padded_datamodule import ROOTPaddedDataModule
+
+        assert config.dataset_override is not None
+        features = list(config.dataset_override.features_columns or [])
+        _, labels = split_columns()
+
+        return ROOTPaddedDataModule(
+            dataset_config={
+                "paths": paths,
+                "features_columns": features,
+                "labels_columns": labels,
+                "format": "root",
+                "max_number_events": config.dataset_override.max_number_events,
+            },
+            tree_name=DELPHES_TREE_NAME,
+            batch_size=BENCH_BATCH_SIZE,
+            batches_in_memory=RDATALOADER_BATCHES_IN_MEMORY,
+            max_vec_sizes={c: MAX_VEC_SIZES[c.split(".")[0]] for c in features + labels},
+            vec_padding=0.0,
+            test_size=0,
+            # PaddedDaskDataset reads sequentially here, so shuffling would be extra work for one side.
+            shuffle=False,
+            # Emit (B, P, F) like PaddedDaskDataset, so both backends hand a model the same thing.
+            particle_major=True,
+        )
+
+    def _test_rdataloader_only_metadata():
+        """Counterpart of `_test_only_metadata`: open the files and build the lazy reader.
+
+        `ROOT.RDataFrame` + `RDataLoader` construction only reads the tree schema; no event data
+        is decompressed, matching what dask's graph building does.
+        """
+        _make_root_datamodule().setup()
+
+    def _test_rdataloader_materialize():
+        """Counterpart of `_test_materialize_partitions`: pull whole columns into memory.
+
+        RDataLoader has no partition-materialization step (it streams fixed-size windows), so the
+        closest analogue is `RDataFrame.AsNumpy()`, which reads whole columns eagerly with no
+        batching and no tensor conversion -- the role `ingestor[field].compute()` plays for dask.
+        One AsNumpy call per column, mirroring the dask arm's one-compute-per-field loop.
+        """
+        import ROOT
+
+        assert config.dataset_override is not None
+        rdf: Any = ROOT.RDataFrame(DELPHES_TREE_NAME, paths)
+        for column in list(config.dataset_override.features_columns or []):
+            if config.dataset_override.max_number_events > 0:
+                rdf = rdf.Filter(f"rdfentry_ < {config.dataset_override.max_number_events}")
+            _ = rdf.AsNumpy([column])
+
+    def _test_rdataloader_iterate():
+        """Counterpart of `_test_iterate_dataloader`: full pass over every batch.
+
+        This is the only stage that is a genuine like-for-like comparison: both sides hand back
+        padded float32 tensors ready for a model.
+        """
+        datamodule = _make_root_datamodule()
+        datamodule.setup()
+
+        for _ in datamodule.train_dataloader():
             pass
 
     test_methods = {
@@ -237,6 +365,14 @@ def run_test(
         "materialize_partitions": _test_materialize_partitions,
         "iterate_dataloader": _test_iterate_dataloader,
     }
+    rdataloader_methods = {
+        "only_metadata": _test_rdataloader_only_metadata,
+        "materialize_partitions": _test_rdataloader_materialize,
+        "iterate_dataloader": _test_rdataloader_iterate,
+    }
+
+    if file_type == "rdataloader":
+        return rdataloader_methods[method]
 
     return test_methods[method]
 
@@ -244,7 +380,7 @@ def run_test(
 @pytest.mark.parametrize("file_percentage", BenchmarkUtility.FILE_PERCENTAGE)
 @pytest.mark.parametrize("column_mode", BenchmarkUtility.COLUMN_MODES)
 @pytest.mark.parametrize("num_events", BenchmarkUtility.NUM_EVENTS)
-@pytest.mark.parametrize("file_type", ["root", "parquet"])
+@pytest.mark.parametrize("file_type", ["root", "parquet", "rdataloader"])
 @pytest.mark.parametrize("test_method", ["only_metadata", "materialize_partitions", "iterate_dataloader"])
 def test_ingestion_speed(
     benchmark: BenchmarkFixture,
@@ -253,7 +389,7 @@ def test_ingestion_speed(
     delphes_sample_parquet: str,
     column_mode: str,
     file_percentage: Percentage,
-    file_type: Literal["parquet", "root"],
+    file_type: FileType,
     test_method: Literal["only_metadata", "materialize_partitions", "iterate_dataloader"],
     num_events: int,
     drop_branches=["ref", "fName", "fSize", "fP", "fE", "fBits"],
@@ -279,6 +415,9 @@ def test_ingestion_speed(
             Defaults to ["ref", "fName", "fSize", "fP", "fE", "fBits"], which are invalid branches
             in the default Delphes dataset.
     """
+    if file_type == "rdataloader":
+        pytest.importorskip("ROOT", reason="PyROOT not available; skipping the RDataLoader arm")
+
     if file_type == "parquet":
         convert_root_to_parquet(
             delphes_sample_root,
@@ -287,6 +426,7 @@ def test_ingestion_speed(
         )
         data_path = delphes_sample_parquet
     else:
+        # both "root" (uproot) and "rdataloader" (native ROOT) read the same .root files
         data_path = delphes_sample_root
 
     config: EstimatorConfig = benchmark_config

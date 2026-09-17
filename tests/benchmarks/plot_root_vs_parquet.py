@@ -20,7 +20,13 @@ import mplhep
 import numpy as np
 import pandas as pd
 
-FILE_TYPES = ["parquet", "root"]
+FILE_TYPES = ["parquet", "root", "rdataloader"]
+# Pretty x-axis labels; "rdataloader" reads the same .root files as "root", just via PyROOT.
+FILE_TYPE_LABELS = {
+    "parquet": "parquet\n(dask)",
+    "root": "root\n(uproot)",
+    "rdataloader": "root\n(RDataLoader)",
+}
 COMPONENTS = ["Graph Building", "Column-based Iteration", "Row-based Iteration"]
 TEST_METHODS = ["only_metadata", "materialize_partitions", "iterate_dataloader"]
 COLORS = ["lightcoral", "lightgreen", "lightblue"]
@@ -28,6 +34,11 @@ RESULTS_DIR = Path(__file__).parent / "results"
 PLOTS_DIR = Path(__file__).parent / "plots"
 DEFAULT_OUTPUT = PLOTS_DIR / "ingestion_decomposed.pdf"
 INPUT_FILES = [RESULTS_DIR / "root_vs_parquet_fast.json", RESULTS_DIR / "root_vs_parquet_slow.json"]
+
+# Description of the files, drawn inside the axes. Edit when pointing at a different dataset.
+# Current values: the 21-file Delphes set (443 branches, 21 GB as .root / 20 GB as .parquet),
+# of which the benchmark reads 7 feature columns + 1 label over all 210k events.
+ANNOTATION = "Files: 443 columns, 21GB\nRead: 8 columns, 210k events"
 
 
 def load_benchmark_json(path: Union[str, Path], merge_index: bool = False) -> pd.DataFrame:
@@ -154,38 +165,64 @@ def plot_root_vs_parquet(
     Returns:
         matplotlib.figure.Figure: The created figure (caller is responsible for `plt.close(fig)`).
     """
-    times = {}
-    for ft in FILE_TYPES:
-        graph_building = grouped.loc[ft, "only_metadata"]
-        materialization = grouped.loc[ft, "materialize_partitions"] - graph_building
-        total = grouped.loc[ft, "iterate_dataloader"] - graph_building
-        times[ft] = [graph_building, materialization, total]
+    # Only plot backends actually present: the rdataloader arm is skipped when PyROOT is
+    # unavailable and must not blow up the plot when missing.
+    present = grouped.index.get_level_values("file_type")
+    file_types = [ft for ft in FILE_TYPES if ft in present]
+    if not file_types:
+        raise ValueError(f"None of {FILE_TYPES} are present in the benchmark data.")
 
-    x = np.arange(len(FILE_TYPES))
+    times = {}
+    for ft in file_types:
+        graph_building = grouped.loc[ft, "only_metadata"]
+        materialize = grouped.loc[ft, "materialize_partitions"]
+        iterate = grouped.loc[ft, "iterate_dataloader"]
+
+        if materialize < iterate:
+            # Nested: materialization is a genuine sub-phase of the full iteration (the dask arms
+            # materialize each partition, then walk its rows), so the stages subtract.
+            materialization = materialize - graph_building
+            total = iterate - materialize
+        else:
+            # NOT nested. RDataLoader's AsNumpy() is a separate code path, not a sub-phase of its
+            # streaming iteration, so `iterate - materialize` is meaningless (often negative).
+            # Draw it as a standalone reference and measure row iteration from graph building --
+            # so this backend's bars do NOT sum to its total.
+            materialization = materialize - graph_building
+            total = iterate - graph_building
+            print(
+                f"[note] {ft}: materialize ({materialize:.3f}s) >= iterate ({iterate:.3f}s), so the "
+                "stages are not nested. Its 'Column-based Iteration' bar is a standalone reference "
+                "(a different code path) and its bars do not sum to its end-to-end time."
+            )
+
+        times[ft] = [graph_building, max(0.0, materialization), max(0.0, total)]
+
+    x = np.arange(len(file_types))
     width = 0.25
 
-    fig, ax = plt.subplots(figsize=(5, 4), dpi=600)
+    fig, ax = plt.subplots(figsize=(2.4 * len(file_types) + 1.6, 4.6), dpi=600)
     for i, comp in enumerate(COMPONENTS):
         ax.bar(
             x + i * width,
-            [times[ft][i] for ft in FILE_TYPES],
+            [times[ft][i] for ft in file_types],
             width,
             label=comp,
             color=COLORS[i],
             alpha=1,
             zorder=2,
         )
-        for j, ft in enumerate(FILE_TYPES):
+        for j, ft in enumerate(file_types):
             bar_x = x[j] + i * width
             bar_height = times[ft][i]
             unit = "ms" if bar_height < 1 else "s"
             value = bar_height * 1000 if unit == "ms" else bar_height
             ax.text(bar_x, bar_height + 0.01, f"{value:.1f}{unit}", ha="center", va="bottom", fontsize=8)
 
-    ax.set_xlabel("File Type")
+    ax.set_xlabel("Ingestion backend")
     ax.set_ylabel("Average Time [s]")
     ax.set_xticks(x + width)
-    ax.set_xticklabels(FILE_TYPES)
+    ax.set_xticklabels([FILE_TYPE_LABELS.get(ft, ft) for ft in file_types])
     max_height = max(v for values in times.values() for v in values)
     ax.set_ylim(top=max_height * 1.35)
     ax.legend(loc="upper left")
@@ -228,12 +265,25 @@ def main(argv: Optional[list] = None) -> Path:
         help=f"Path to a pytest-benchmark JSON file. Defaults to {[str(p) for p in INPUT_FILES]}.",
     )
     parser.add_argument("--output", type=str, default=str(DEFAULT_OUTPUT), help="Where to save the plot.")
+    parser.add_argument("--column-mode", type=str, default="config", choices=["one", "config"],
+                        help="Which column_mode slice to plot.")
+    parser.add_argument("--file-percentage", type=float, default=0.0,
+                        help="Which file_percentage slice to plot. Use 100 for the full file list.")
+    parser.add_argument("--num-events", type=int, default=1000,
+                        help="Which num_events slice to plot. Use -1 for the 'all events' parametrization.")
+    parser.add_argument("--annotation", type=str, default=ANNOTATION,
+                        help="Text box drawn on the plot. Defaults to the ANNOTATION constant.")
     args = parser.parse_args(argv)
 
     PLOTS_DIR.mkdir(parents=True, exist_ok=True)
     df = load_benchmark_json(Path(args.input)) if args.input else load_default_benchmarks()
-    grouped = select_benchmarks(df)
-    annotation = "Files: 800 columns, 130GB\n" "Read: 8 columns, 1.3M events"
+    grouped = select_benchmarks(
+        df,
+        column_mode=args.column_mode,
+        file_percentage=args.file_percentage,
+        num_events=args.num_events,
+    )
+    annotation = args.annotation
     fig = plot_root_vs_parquet(grouped, args.output, annotation=annotation)
     plt.close(fig)
 

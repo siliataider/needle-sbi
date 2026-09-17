@@ -10,6 +10,37 @@ def _add_particle_dim(batch: Any) -> Any:
     return x.unsqueeze(1), y.unsqueeze(1)
 
 
+def _particle_major(batch: Any, max_vec_size: int, contiguous: bool = True) -> Any:
+    """Reshape RDataLoader's flat per-event vector into `PaddedDataset`'s `(B, P, F)` layout.
+
+    RDataLoader concatenates each padded column end to end, so an event arrives as
+    `[col0 x P | col1 x P | ...]` (column-major, verified against the source branches). Splitting
+    that into `(B, F, P)` and transposing the last two axes yields the same `(batch, particles,
+    features)` layout `PaddedDatasetBase.convert_ak_to_tensor` produces, so both backends hand a
+    model the identical thing.
+
+    Only valid when every column shares one padding width -- with per-collection widths (e.g.
+    Track=253, Photon=3) there is no single `P` and the flat layout is the only correct one.
+
+    Args:
+        batch: `(x, y)` as produced by `RDataLoader.as_torch()`, each `(B, n_columns * P)`.
+        max_vec_size: The shared padding width `P`.
+        contiguous: Materialise the transpose. `transpose` alone returns a non-contiguous view,
+            which would hide the cost of the layout change from any benchmark timing this.
+
+    Returns:
+        tuple: `(x, y)` shaped `(B, P, F)`.
+    """
+
+    def _reshape(tensor: Any) -> Any:
+        n_columns = tensor.shape[-1] // max_vec_size
+        out = tensor.view(tensor.shape[0], n_columns, max_vec_size).transpose(1, 2)
+        return out.contiguous() if contiguous else out
+
+    x, y = batch
+    return _reshape(x), _reshape(y)
+
+
 class ROOTPaddedDataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -23,6 +54,7 @@ class ROOTPaddedDataModule(L.LightningDataModule):
         shuffle: bool = True,
         set_seed: int = 0,
         drop_remainder: bool = False,
+        particle_major: bool = False,
     ) -> None:
         super().__init__()
         self.dataset_config = DatasetConfig(**dataset_config)
@@ -35,6 +67,9 @@ class ROOTPaddedDataModule(L.LightningDataModule):
         self.shuffle = shuffle
         self.set_seed = set_seed
         self.drop_remainder = drop_remainder
+        # Emit (B, P, F) like PaddedDataset instead of RDataLoader's flat (B, 1, F*P). Requires a
+        # single shared padding width; see `_particle_major`.
+        self.particle_major = particle_major
 
     def _make_loader(self) -> Any:
         import ROOT
@@ -73,9 +108,23 @@ class ROOTPaddedDataModule(L.LightningDataModule):
             self._train = loader
             self._val = self._make_loader()
 
+    def _shape_batches(self, loader: Any) -> Any:
+        """Apply the configured output layout to every batch of `loader`."""
+        if not self.particle_major:
+            return map(_add_particle_dim, loader.as_torch())
+
+        widths = set((self.max_vec_sizes or {}).values())
+        if len(widths) != 1:
+            raise ValueError(
+                "particle_major=True needs one shared max_vec_size across all columns, got "
+                f"{sorted(widths)}. With per-collection widths there is no single particle axis."
+            )
+        max_vec_size = widths.pop()
+        return map(lambda batch: _particle_major(batch, max_vec_size), loader.as_torch())
+
     def train_dataloader(self):
         print("Creating train dataloader...")
-        return map(_add_particle_dim, self._train.as_torch())
+        return self._shape_batches(self._train)
 
     def val_dataloader(self):
-        return map(_add_particle_dim, self._val.as_torch())
+        return self._shape_batches(self._val)

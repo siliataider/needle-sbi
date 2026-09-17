@@ -33,6 +33,7 @@ METHODS = [
     ("test_root_iterative_setup", "test_root_iterative_read", "ROOT, uproot.iterate", "s"),
     ("test_parquet_dask_setup", "test_parquet_dask_read", "Parquet, dak.from_parquet", "^"),
     ("test_parquet_iterative_setup", "test_parquet_iterative_read", "Parquet, ak.from_parquet", "D"),
+    ("test_rdataloader_setup", "test_rdataloader_read", "ROOT, RDataLoader", "v"),
 ]
 
 

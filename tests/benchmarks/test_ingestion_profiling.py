@@ -1,11 +1,18 @@
 """
-Profile ROOT/parquet ingestion setup and read cost across four strategies:
+Profile ROOT/parquet ingestion setup and read cost across five strategies:
 
 - ``root_dask``: `Ingestor(format="root")` -- `uproot.dask` graph/form construction.
 - ``root_iterative``: `IterativeIngestor` -- `uproot.num_entries` metadata only, no dask graph.
 - ``parquet_dask``: `Ingestor(format="parquet")` -- `dak.from_parquet` graph construction.
 - ``parquet_iterative``: `IterativeParquetIngestor` -- `pyarrow.parquet.ParquetFile` metadata only,
   no dask graph.
+- ``rdataloader``: `ROOTPaddedDataModule` -- ROOT's native RDataLoader, reading the same .root
+  files as the two uproot strategies. Skipped automatically when PyROOT is unavailable.
+
+Note that ``rdataloader`` is not a like-for-like comparison: the other four yield jagged awkward
+arrays, while RDataLoader yields *fixed-width padded* float32 torch tensors. For this column set
+that is ~2042 padded values per event against ~780 real ones, plus a tensor conversion the others
+never pay. Read it as "what a training-ready batch costs", not "what reading these columns costs".
 
 See `tests/benchmarks/plot_ingestion_profiling.py` for the plots built from this data, and
 `tests/benchmarks/test_root_vs_parquet.py` for the original, broader-scope ROOT-vs-parquet
@@ -21,7 +28,7 @@ mind `num_files` when adding new parametrizations.
 Disclaimer: Part of this code was written with the help of GPT-5 and Claude Sonnet 5.
 """
 
-from typing import Callable, List
+from typing import Any, Callable, List
 
 import pytest
 from pytest_benchmark.fixture import BenchmarkFixture
@@ -70,6 +77,21 @@ NUM_ROUNDS: int = 3
 NUM_ITERATIONS: int = 1
 NUM_WARMUP_ROUNDS: int = 0
 
+# --- RDataLoader ------------------------------------------------------------------------------
+# `ROOTPaddedDataModule` wraps ROOT's native RDataLoader. It reads the *same* .root files as the
+# two uproot strategies, so any difference is attributable to the reader rather than the format.
+#
+# Unlike uproot/awkward, RDataLoader materialises jagged columns at a *fixed* width, so every
+# collection needs an explicit cap. These are the global maxima of the `Track_size` / `Photon_size`
+# counter branches over all 21 files -- anything smaller would silently truncate events and make
+# the comparison meaningless. Note this costs RDataLoader real work: Track averages 97 entries per
+# event against a 253-wide buffer, and Photon averages 0.1 against 3.
+MAX_VEC_SIZES: dict[str, int] = {"Track": 253, "Photon": 3}
+
+TREE_NAME: str = "Delphes"
+RDATALOADER_BATCH_SIZE: int = 1024
+RDATALOADER_BATCHES_IN_MEMORY: int = 10
+
 
 def _filter_name(columns: List[str]) -> Callable[[str], bool]:
     """Build a `filter_name` predicate that keeps only the requested columns (ROOT only)."""
@@ -82,6 +104,35 @@ def _filter_name(columns: List[str]) -> Callable[[str], bool]:
 
 def _compute_dask_array(ingestor: Ingestor) -> None:
     ingestor.array.compute()
+
+
+def _make_root_datamodule(paths: List[str], columns: List[str]) -> Any:
+    """Build a `ROOTPaddedDataModule` over the same files and columns as the other strategies.
+
+    `ROOTPaddedDataModule` requires a non-empty `labels_columns`, which the other four strategies
+    have no equivalent for. Reusing the last feature column as the target keeps the number of
+    *distinct* columns read identical to the other strategies (`len(columns)`); RDataLoader reads
+    it once per event loop and copies it into the target tensor.
+    """
+    from needle.ml.lightning.datamodules.root_padded_datamodule import ROOTPaddedDataModule
+
+    return ROOTPaddedDataModule(
+        dataset_config={
+            "paths": paths,
+            "features_columns": columns,
+            "labels_columns": [columns[-1]],
+            "format": "root",
+            "max_number_events": -1,
+        },
+        tree_name=TREE_NAME,
+        batch_size=RDATALOADER_BATCH_SIZE,
+        batches_in_memory=RDATALOADER_BATCHES_IN_MEMORY,
+        max_vec_sizes={column: MAX_VEC_SIZES[column.split(".")[0]] for column in columns},
+        vec_padding=0.0,
+        test_size=0,
+        # The other strategies read sequentially; shuffling here would be extra work for one side.
+        shuffle=False,
+    )
 
 
 @pytest.fixture()
@@ -233,6 +284,43 @@ def test_parquet_iterative_read(
 
     def _read() -> None:
         for _ in ingestor.iterate():
+            pass
+
+    benchmark.pedantic(_read, rounds=NUM_ROUNDS, iterations=NUM_ITERATIONS, warmup_rounds=NUM_WARMUP_ROUNDS)
+
+
+@pytest.mark.parametrize("column_mode", ["few", "many"])
+@pytest.mark.parametrize("num_files", NUM_FILES)
+def test_rdataloader_setup(benchmark: BenchmarkFixture, root_paths: List[str], num_files: int, column_mode: str) -> None:
+    """Upfront cost of `ROOTPaddedDataModule.setup()`: `ROOT.RDataFrame` construction plus
+    `RDataLoader` creation, which reads the TTree schema only. No event data is read.
+    """
+    pytest.importorskip("ROOT", reason="PyROOT not available; skipping the RDataLoader strategy")
+    columns = COLUMN_SETS[column_mode]
+    paths = root_paths[:num_files]
+
+    def _setup() -> Any:
+        datamodule = _make_root_datamodule(paths, columns)
+        datamodule.setup()
+        return datamodule
+
+    benchmark.pedantic(_setup, rounds=NUM_ROUNDS, iterations=NUM_ITERATIONS, warmup_rounds=NUM_WARMUP_ROUNDS)
+
+
+@pytest.mark.parametrize("column_mode", ["few", "many"])
+@pytest.mark.parametrize("num_files", NUM_FILES)
+def test_rdataloader_read(benchmark: BenchmarkFixture, root_paths: List[str], num_files: int, column_mode: str) -> None:
+    """Cost of a full pass over every batch of an already-built `ROOTPaddedDataModule`, i.e. every
+    requested column read and converted to padded torch tensors.
+    """
+    pytest.importorskip("ROOT", reason="PyROOT not available; skipping the RDataLoader strategy")
+    columns = COLUMN_SETS[column_mode]
+    paths = root_paths[:num_files]
+    datamodule = _make_root_datamodule(paths, columns)
+    datamodule.setup()
+
+    def _read() -> None:
+        for _ in datamodule.train_dataloader():
             pass
 
     benchmark.pedantic(_read, rounds=NUM_ROUNDS, iterations=NUM_ITERATIONS, warmup_rounds=NUM_WARMUP_ROUNDS)
