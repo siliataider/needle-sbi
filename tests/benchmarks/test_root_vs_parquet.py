@@ -32,6 +32,7 @@ above.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Any, Callable, Dict, List, Literal, cast
 
@@ -54,27 +55,20 @@ DELPHES_DATASET_CONFIG = Path(__file__).parents[1] / "conf_tests" / "datasets" /
 
 FileType = Literal["parquet", "root", "rdataloader"]
 
-# --- RDataLoader arm --------------------------------------------------------------------------
-# "rdataloader" reads the *same .root files* as the "root" arm, but through ROOT's native
-# RDataLoader (via ROOTPaddedDataModule) instead of uproot -> dask_awkward -> PaddedDaskDataset.
-#
-# Batch size for EVERY backend -- the dask arms' torch DataLoader and RDataLoader alike -- so the
-# comparison always happens at one operating point. Default 1 reproduces upstream (a bare
-# `DataLoader(dataset)` uses torch's default batch_size=1), but 1 is a degenerate point for
-# RDataLoader: its in-memory window is batch_size * batches_in_memory, so batch_size=1 leaves it
-# doing a C++ round trip per single event. Set BENCH_BATCH_SIZE=512 for a realistic comparison.
+
 BENCH_BATCH_SIZE = int(os.getenv("BENCH_BATCH_SIZE", "1"))
-# RDataLoader's resident window is batch_size * batches_in_memory events. 200000 makes that window
-# cover the whole dataset at every BENCH_BATCH_SIZE (>= 200k events even at batch_size=1), so the
-# batch size never shrinks it. For reference, `PaddedDaskDataset` holds one partition (one file,
-# 10k events here) at a time; matching that instead (e.g. 20 at batch 512) measured ~2% slower for
-# 0.6 GB less RSS.
-RDATALOADER_BATCHES_IN_MEMORY = int(os.getenv("RDATALOADER_BATCHES_IN_MEMORY", "200000"))
+RDATALOADER_BATCHES_IN_MEMORY = int(
+    os.getenv("RDATALOADER_BATCHES_IN_MEMORY", str(max(2, 1024 // BENCH_BATCH_SIZE)))
+)
 # Delphes collections are jagged, and RDataLoader materialises them at a fixed width. These are the
 # global maxima of the `<Collection>_size` counter branches over the dataset; anything smaller
 # silently truncates events.
 MAX_VEC_SIZES: Dict[str, int] = {"Track": 253, "Photon": 3}
 DELPHES_TREE_NAME = os.getenv("DELPHES_TREE_NAME", "Delphes")
+
+def collection_of(column: str) -> str:
+    """`Track.PT` and `Track_PT` both belong to the `Track` collection."""
+    return re.split(r"[._]", column, maxsplit=1)[0]
 
 
 @pytest.fixture()
@@ -314,7 +308,7 @@ def run_test(
             tree_name=DELPHES_TREE_NAME,
             batch_size=BENCH_BATCH_SIZE,
             batches_in_memory=RDATALOADER_BATCHES_IN_MEMORY,
-            max_vec_sizes={c: MAX_VEC_SIZES[c.split(".")[0]] for c in features + labels},
+            max_vec_sizes={c: MAX_VEC_SIZES[collection_of(c)] for c in features + labels},
             vec_padding=0.0,
             test_size=0,
             # PaddedDaskDataset reads sequentially here, so shuffling would be extra work for one side.
@@ -337,13 +331,14 @@ def run_test(
         RDataLoader has no partition-materialization step (it streams fixed-size windows), so the
         closest analogue is `RDataFrame.AsNumpy()`, which reads whole columns eagerly with no
         batching and no tensor conversion -- the role `ingestor[field].compute()` plays for dask.
-        One AsNumpy call per column, mirroring the dask arm's one-compute-per-field loop.
+        One AsNumpy call per column, mirroring the dask arm's one-compute-per-field loop, each over
+        an RDataFrame with only that branch enabled (see `make_rdataframe`).
         """
-        import ROOT
+        from needle.ml.lightning.datamodules.root_padded_datamodule import make_rdataframe
 
         assert config.dataset_override is not None
-        rdf: Any = ROOT.RDataFrame(DELPHES_TREE_NAME, paths)
         for column in list(config.dataset_override.features_columns or []):
+            rdf, _chain = make_rdataframe(DELPHES_TREE_NAME, paths, [column])
             if config.dataset_override.max_number_events > 0:
                 rdf = rdf.Filter(f"rdfentry_ < {config.dataset_override.max_number_events}")
             _ = rdf.AsNumpy([column])

@@ -41,6 +41,30 @@ def _particle_major(batch: Any, max_vec_size: int, contiguous: bool = True) -> A
     return _reshape(x), _reshape(y)
 
 
+def make_rdataframe(tree_name: str, paths: Any, columns: list[str]) -> tuple[Any, Any]:
+    """Build an RDataFrame over `paths` that only reads `columns` from disk.
+
+    `ROOT.RDataFrame(tree_name, paths)` leaves every branch enabled. For split collections such as
+    Delphes' `TClonesArray`s, reading one member (`Track.PT`) then deserialises every enabled member
+    of that collection (all 52 for `Track`). Disabling everything and
+    re-enabling the requested branches restores member-wise reading, and is a no-op for trees whose
+    columns are independent top-level branches.
+
+    Returns:
+        tuple: `(rdf, chain)`. The RDataFrame does not own the TChain, so keep the chain alive for as
+        long as the RDataFrame is used.
+    """
+    import ROOT
+
+    chain = ROOT.TChain(tree_name)
+    for path in [paths] if isinstance(paths, str) else paths:
+        chain.Add(str(path))
+    chain.SetBranchStatus("*", 0)
+    for column in columns:
+        chain.SetBranchStatus(column, 1)
+    return ROOT.RDataFrame(chain), chain
+
+
 class ROOTPaddedDataModule(L.LightningDataModule):
     def __init__(
         self,
@@ -70,12 +94,15 @@ class ROOTPaddedDataModule(L.LightningDataModule):
         # Emit (B, P, F) like PaddedDataset instead of RDataLoader's flat (B, 1, F*P). Requires a
         # single shared padding width; see `_particle_major`.
         self.particle_major = particle_major
+        # TChains backing the RDataFrames built in `_make_loader`; see `make_rdataframe`.
+        self._chains: list[Any] = []
 
     def _make_loader(self) -> Any:
-        import ROOT
         from ROOT.Experimental.ML import RDataLoader
 
-        rdf: Any = ROOT.RDataFrame(self.tree_name, self.dataset_config.paths)
+        columns = list(dict.fromkeys(self.dataset_config.features_columns + self.dataset_config.labels_columns))
+        rdf, chain = make_rdataframe(self.tree_name, self.dataset_config.paths, columns)
+        self._chains.append(chain)
 
         if self.dataset_config.max_number_events > 0:
             rdf = rdf.Filter(f"rdfentry_ < {self.dataset_config.max_number_events}")
